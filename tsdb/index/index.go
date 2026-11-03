@@ -1154,32 +1154,52 @@ func (r *Reader) PostingsRanges() (map[labels.Label]Range, error) {
 
 type Symbols struct {
 	bs      ByteSlice
-	version int
 	off     int
-
-	offsets []int
 	seen    int
+	version int
+
+	// Offsets store byte positions in bs for every symbolFactor-th symbol.
+	offsets []int
+	// Direct offsets are relative to off+4 and are only built for compaction.
+	directOffsets []uint32
 }
 
 const symbolFactor = 32
 
 // NewSymbols returns a Symbols object for symbol lookups.
 func NewSymbols(bs ByteSlice, version, off int) (*Symbols, error) {
+	return newSymbols(bs, version, off, false)
+}
+
+func newSymbols(bs ByteSlice, version, off int, direct bool) (*Symbols, error) {
 	s := &Symbols{
 		bs:      bs,
-		version: version,
 		off:     off,
+		version: version,
 	}
 	d := encoding.NewDecbufAt(bs, off, castagnoliTable)
-	var (
-		origLen = d.Len()
-		cnt     = d.Be32int()
-		basePos = off + 4
-	)
+	origLen := d.Len()
+	cnt := d.Be32int()
+	if d.Err() != nil {
+		return nil, d.Err()
+	}
+	// Every symbol needs at least one byte for its encoded length.
+	if cnt < 0 || cnt > d.Len() {
+		return nil, encoding.ErrInvalidSize
+	}
+
+	direct = direct && version != FormatV1
 	s.offsets = make([]int, 0, 1+cnt/symbolFactor)
+	if direct {
+		s.directOffsets = make([]uint32, 0, cnt)
+	}
 	for d.Err() == nil && s.seen < cnt {
+		position := origLen - d.Len()
+		if direct {
+			s.directOffsets = append(s.directOffsets, uint32(position))
+		}
 		if s.seen%symbolFactor == 0 {
-			s.offsets = append(s.offsets, basePos+origLen-d.Len())
+			s.offsets = append(s.offsets, off+4+position)
 		}
 		d.UvarintBytes() // The symbol.
 		s.seen++
@@ -1198,13 +1218,17 @@ func (s Symbols) Lookup(o uint32) (string, error) {
 	if s.version == FormatV1 {
 		d.Skip(int(o))
 	} else {
-		if int(o) >= s.seen {
+		if uint64(o) >= uint64(s.seen) {
 			return "", fmt.Errorf("unknown symbol offset %d", o)
 		}
-		d.Skip(s.offsets[int(o/symbolFactor)])
-		// Walk until we find the one we want.
-		for i := o - (o / symbolFactor * symbolFactor); i > 0; i-- {
-			d.UvarintBytes()
+		if s.directOffsets != nil {
+			d.Skip(s.off + 4 + int(s.directOffsets[int(o)]))
+		} else {
+			d.Skip(s.offsets[int(o/symbolFactor)])
+			// Walk until we find the one we want.
+			for i := o - (o / symbolFactor * symbolFactor); i > 0; i-- {
+				d.UvarintBytes()
+			}
 		}
 	}
 	sym := d.UvarintStr()
@@ -1257,8 +1281,9 @@ func (s Symbols) ReverseLookup(sym string) (uint32, error) {
 	return uint32(res), nil
 }
 
+// Size returns the symbol-offset size used by reader memory accounting, in bytes.
 func (s Symbols) Size() int {
-	return len(s.offsets) * 8
+	return len(s.offsets)*8 + len(s.directOffsets)*4
 }
 
 func (s Symbols) Iter() StringIter {
@@ -1334,6 +1359,26 @@ func (r *Reader) lookupSymbol(_ context.Context, o uint32) (string, error) {
 		return s, nil
 	}
 	return r.symbols.Lookup(o)
+}
+
+// WithDirectSymbolLookup returns a reader with a direct symbol-offset table for
+// compaction. Its construction and memory cost are paid by the caller, not by
+// ordinary readers. The returned reader borrows the original reader's byte slice:
+// the original reader must remain open until the returned reader is no longer
+// used. Closing the returned reader does not close the original reader.
+func (r *Reader) WithDirectSymbolLookup() (*Reader, error) {
+	reader := *r
+	reader.c = io.NopCloser(nil)
+	if r.version == FormatV1 {
+		return &reader, nil
+	}
+	symbols, err := newSymbols(r.b, r.version, int(r.toc.Symbols), true)
+	if err != nil {
+		return nil, err
+	}
+	reader.symbols = symbols
+	reader.dec = &Decoder{LookupSymbol: reader.lookupSymbol, DecodePostings: r.dec.DecodePostings}
+	return &reader, nil
 }
 
 // Symbols returns an iterator over the symbols that exist within the index.

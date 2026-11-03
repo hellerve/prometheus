@@ -935,6 +935,18 @@ func (DefaultBlockPopulator) PopulateBlock(ctx context.Context, metrics *Compact
 			return fmt.Errorf("open index reader for block %+v: %w", b.Meta(), err)
 		}
 		closers = append(closers, indexr)
+		// Keep dense symbol offsets local to this compaction. The block reader
+		// keeps the underlying index mapped until the deferred Close above.
+		if br, ok := indexr.(blockIndexReader); ok {
+			if ir, ok := br.ir.(*index.Reader); ok {
+				direct, err := ir.WithDirectSymbolLookup()
+				if err != nil {
+					return fmt.Errorf("build compaction symbol offsets: %w", err)
+				}
+				br.ir = direct
+				indexr = br
+			}
+		}
 
 		chunkr, err := b.Chunks()
 		if err != nil {
