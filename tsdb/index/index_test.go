@@ -968,3 +968,11 @@ func BenchmarkSymbols(b *testing.B) {
 		})
 	}
 }
+
+func newSymbols(bs ByteSlice, version, off int, direct bool) (*Symbols, error) {
+	s, err := NewSymbols(bs, version, off)
+	if err != nil || !direct {
+		return s, err
+	}
+	return s.withDirectOffsets()
+}

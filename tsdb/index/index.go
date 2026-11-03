@@ -1168,10 +1168,6 @@ const symbolFactor = 32
 
 // NewSymbols returns a Symbols object for symbol lookups.
 func NewSymbols(bs ByteSlice, version, off int) (*Symbols, error) {
-	return newSymbols(bs, version, off, false)
-}
-
-func newSymbols(bs ByteSlice, version, off int, direct bool) (*Symbols, error) {
 	s := &Symbols{
 		bs:      bs,
 		off:     off,
@@ -1188,16 +1184,9 @@ func newSymbols(bs ByteSlice, version, off int, direct bool) (*Symbols, error) {
 		return nil, encoding.ErrInvalidSize
 	}
 
-	direct = direct && version != FormatV1
 	s.offsets = make([]int, 0, 1+cnt/symbolFactor)
-	if direct {
-		s.directOffsets = make([]uint32, 0, cnt)
-	}
 	for d.Err() == nil && s.seen < cnt {
 		position := origLen - d.Len()
-		if direct {
-			s.directOffsets = append(s.directOffsets, uint32(position))
-		}
 		if s.seen%symbolFactor == 0 {
 			s.offsets = append(s.offsets, off+4+position)
 		}
@@ -1208,6 +1197,25 @@ func newSymbols(bs ByteSlice, version, off int, direct bool) (*Symbols, error) {
 		return nil, d.Err()
 	}
 	return s, nil
+}
+
+// With direct offsets, the sparse offsets remain shared and immutable for reverse lookup.
+func (s Symbols) withDirectOffsets() (*Symbols, error) {
+	if s.version == FormatV1 {
+		return &s, nil
+	}
+	d := encoding.NewDecbufAt(s.bs, s.off, castagnoliTable)
+	origLen := d.Len()
+	d.Skip(4) // Skip the symbol count, already validated by NewSymbols.
+	s.directOffsets = make([]uint32, s.seen)
+	for i := range s.directOffsets {
+		s.directOffsets[i] = uint32(origLen - d.Len())
+		d.UvarintBytes()
+	}
+	if d.Err() != nil {
+		return nil, d.Err()
+	}
+	return &s, nil
 }
 
 func (s Symbols) Lookup(o uint32) (string, error) {
@@ -1372,7 +1380,7 @@ func (r *Reader) WithDirectSymbolLookup() (*Reader, error) {
 	if r.version == FormatV1 {
 		return &reader, nil
 	}
-	symbols, err := newSymbols(r.b, r.version, int(r.toc.Symbols), true)
+	symbols, err := r.symbols.withDirectOffsets()
 	if err != nil {
 		return nil, err
 	}
