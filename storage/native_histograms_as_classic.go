@@ -235,6 +235,7 @@ func (m *multipleSeriesSet) Warnings() annotations.Annotations {
 
 // convertedClassicSeries accumulates converted float samples for a single classic series.
 type convertedClassicSeries struct {
+	skip    bool
 	labels  labels.Labels
 	samples []fSample
 }
@@ -242,14 +243,16 @@ type convertedClassicSeries struct {
 // classicSeriesBuilder accumulates converted classic series for a single NHCB series
 // while reusing slice/map capacity across NHCB series in the same SeriesSet.
 type classicSeriesBuilder struct {
-	series  []convertedClassicSeries
-	byLabel map[uint64][]int
-	currST  int64
-	currT   int64
-	emitIdx int
+	leMatchers []*labels.Matcher
+	series     []convertedClassicSeries
+	byLabel    map[uint64][]int
+	currST     int64
+	currT      int64
+	emitIdx    int
 }
 
-func (b *classicSeriesBuilder) reset() {
+func (b *classicSeriesBuilder) reset(leMatchers []*labels.Matcher) {
+	b.leMatchers = leMatchers
 	for i := range b.series {
 		b.series[i].labels = labels.EmptyLabels()
 		// Keep the backing sample slice allocated so subsequent NHCB series
@@ -267,23 +270,23 @@ func (b *classicSeriesBuilder) beginTimestamp(st, t int64) {
 }
 
 func (b *classicSeriesBuilder) emitSample(l labels.Labels, val float64) error {
-	b.addSample(l, fSample{st: b.currST, t: b.currT, f: val})
-	return nil
-}
-
-func (b *classicSeriesBuilder) addSample(l labels.Labels, s fSample) int {
 	// Fast path: when bucket layout has not changed across samples in this NHCB series,
 	// ConvertNHCBToClassic emits buckets in the exact same order as b.series.
 	idx := b.emitIdx
 	b.emitIdx++
-	if idx < len(b.series) && labels.Equal(b.series[idx].labels, l) {
-		b.series[idx].samples = append(b.series[idx].samples, s)
-		return idx
+	if idx >= len(b.series) || !labels.Equal(b.series[idx].labels, l) {
+		idx = b.seriesIndex(l, idx)
 	}
+	s := &b.series[idx]
+	if !s.skip {
+		s.samples = append(s.samples, fSample{st: b.currST, t: b.currT, f: val})
+	}
+	return nil
+}
 
+func (b *classicSeriesBuilder) seriesIndex(l labels.Labels, idx int) int {
 	if idx == len(b.series) && len(b.byLabel) == 0 {
 		b.growSeries(l)
-		b.series[idx].samples = append(b.series[idx].samples, s)
 		return idx
 	}
 
@@ -311,21 +314,24 @@ func (b *classicSeriesBuilder) addSample(l labels.Labels, s fSample) int {
 		b.byLabel[h] = append(b.byLabel[h], idx)
 		b.growSeries(l)
 	}
-	b.series[idx].samples = append(b.series[idx].samples, s)
 	return idx
 }
 
 func (b *classicSeriesBuilder) growSeries(l labels.Labels) {
 	if len(b.series) < cap(b.series) {
 		b.series = b.series[:len(b.series)+1]
-		b.series[len(b.series)-1].labels = l
-		b.series[len(b.series)-1].samples = b.series[len(b.series)-1].samples[:0]
-		return
+	} else {
+		b.series = append(b.series, convertedClassicSeries{})
 	}
-	b.series = append(b.series, convertedClassicSeries{
-		labels:  l,
-		samples: make([]fSample, 0, 8),
-	})
+	s := &b.series[len(b.series)-1]
+	s.labels = l
+	// Remember rejected labels too, so an unchanged layout keeps the fast path
+	// without evaluating the matchers again for each sample.
+	s.skip = !matchesLe(l, b.leMatchers)
+	s.samples = s.samples[:0]
+	if !s.skip && cap(s.samples) == 0 {
+		s.samples = make([]fSample, 0, 8)
+	}
 }
 
 func matchesLe(lset labels.Labels, leMatchers []*labels.Matcher) bool {
@@ -341,12 +347,12 @@ func matchesLe(lset labels.Labels, leMatchers []*labels.Matcher) bool {
 	return true
 }
 
-func (b *classicSeriesBuilder) buildSeries(dst []Series, leMatchers []*labels.Matcher) []Series {
+func (b *classicSeriesBuilder) buildSeries(dst []Series) []Series {
 	matchCount := 0
 	totalSamples := 0
 	for i := range b.series {
 		s := &b.series[i]
-		if len(s.samples) == 0 || !matchesLe(s.labels, leMatchers) {
+		if len(s.samples) == 0 {
 			continue
 		}
 		matchCount++
@@ -365,7 +371,7 @@ func (b *classicSeriesBuilder) buildSeries(dst []Series, leMatchers []*labels.Ma
 
 	for i := range b.series {
 		s := &b.series[i]
-		if len(s.samples) == 0 || !matchesLe(s.labels, leMatchers) {
+		if len(s.samples) == 0 {
 			continue
 		}
 		n := len(s.samples)
@@ -434,7 +440,7 @@ func (s *nhcbToClassicSeriesSet) Next() bool {
 }
 
 func (s *nhcbToClassicSeriesSet) convertSeries(dst []Series, nhcbSeries Series) []Series {
-	s.builder.reset()
+	s.builder.reset(s.leMatchers)
 	if s.emitFn == nil {
 		s.emitFn = s.builder.emitSample
 	}
@@ -488,7 +494,7 @@ func (s *nhcbToClassicSeriesSet) convertSeries(dst []Series, nhcbSeries Series) 
 		return nil
 	}
 
-	return s.builder.buildSeries(dst, s.leMatchers)
+	return s.builder.buildSeries(dst)
 }
 
 func (s *nhcbToClassicSeriesSet) At() Series {
